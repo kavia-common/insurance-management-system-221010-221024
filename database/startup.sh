@@ -4,9 +4,10 @@
 DB_NAME="myapp"
 DB_USER="appuser"
 DB_PASSWORD="dbuser123"
-DB_PORT="5000"
+# Updated to run on port 5001
+DB_PORT="5001"
 
-echo "Starting PostgreSQL setup..."
+echo "Starting PostgreSQL setup on port ${DB_PORT}..."
 
 # Find PostgreSQL version and set paths
 PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
@@ -53,25 +54,32 @@ if [ ! -f "/var/lib/postgresql/data/PG_VERSION" ]; then
     sudo -u postgres ${PG_BIN}/initdb -D /var/lib/postgresql/data
 fi
 
-# Start PostgreSQL server in background
+# Start PostgreSQL server in background on 0.0.0.0 to expose port properly
 echo "Starting PostgreSQL server..."
-sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
+sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} -h 0.0.0.0 &
 
 # Wait for PostgreSQL to start
 echo "Waiting for PostgreSQL to start..."
 sleep 5
 
 # Check if PostgreSQL is running
-for i in {1..15}; do
+READY=0
+for i in {1..20}; do
     if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
         echo "PostgreSQL is ready!"
+        READY=1
         break
     fi
-    echo "Waiting... ($i/15)"
+    echo "Waiting... ($i/20)"
     sleep 2
 done
 
-# Create database and user
+if [ "$READY" -ne 1 ]; then
+    echo "Error: PostgreSQL did not become ready on port ${DB_PORT}"
+    exit 1
+fi
+
+# Create database and user (no schema creation; Django migrations will handle DDL)
 echo "Setting up database and user..."
 sudo -u postgres ${PG_BIN}/createdb -p ${DB_PORT} ${DB_NAME} 2>/dev/null || echo "Database might already exist"
 
@@ -89,51 +97,27 @@ END
 
 -- Grant database-level permissions
 GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
+EOF
 
--- Connect to the specific database for schema-level permissions
-\c ${DB_NAME}
-
--- For PostgreSQL 15+, we need to handle public schema permissions differently
--- First, grant usage on public schema
+# Ensure the user has privileges within the target DB without manually creating schema
+sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
 GRANT USAGE ON SCHEMA public TO ${DB_USER};
-
--- Grant CREATE permission on public schema
 GRANT CREATE ON SCHEMA public TO ${DB_USER};
-
--- Make the user owner of all future objects they create in public schema
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
-
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
-
--- Alternative: Grant all privileges on schema public to the user
 GRANT ALL ON SCHEMA public TO ${DB_USER};
-
--- Ensure the user can work with any existing objects
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
 EOF
 
-# Additionally, connect to the specific database to ensure permissions
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
--- Double-check permissions are set correctly in the target database
-GRANT ALL ON SCHEMA public TO ${DB_USER};
-GRANT CREATE ON SCHEMA public TO ${DB_USER};
-
--- Show current permissions for debugging
-\dn+ public
-EOF
-
-# Save connection command to a file
+# Save connection command to a file (reflects port 5001)
 echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME}" > db_connection.txt
 echo "Connection string saved to db_connection.txt"
 
-# Save environment variables to a file
+# Save environment variables to a file for db visualizer (reflects port 5001)
 cat > db_visualizer/postgres.env << EOF
 export POSTGRES_URL="postgresql://localhost:${DB_PORT}/${DB_NAME}"
 export POSTGRES_USER="${DB_USER}"
@@ -147,7 +131,6 @@ echo "Database: ${DB_NAME}"
 echo "User: ${DB_USER}"
 echo "Port: ${DB_PORT}"
 echo ""
-
 echo "Environment variables saved to db_visualizer/postgres.env"
 echo "To use with Node.js viewer, run: source db_visualizer/postgres.env"
 
